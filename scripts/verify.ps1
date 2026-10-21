@@ -49,3 +49,4 @@ if ($LASTEXITCODE -eq 0) { throw 'Invalid workers accepted' }
 if ($LASTEXITCODE -eq 0) { throw 'Unsupported plan accepted' }
 "Cleanup complete; scratch fixture removed; CLI evidence retained" | Tee-Object -FilePath $proof -Append
 if (-not (Test-Path $proof) -or -not (Test-Path evidence/parquet.csv)) { throw 'Cleanup removed evidence' }
+exit 0

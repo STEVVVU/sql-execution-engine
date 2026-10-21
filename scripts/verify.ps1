@@ -17,7 +17,9 @@ $queries = @(
  'select category,count(*) as n,sum(value) as total from l group by category order by category',
  'select l.id,l.value,r.value as rv from l join r on l.id=r.id and l.category=r.category order by l.value,rv',
  'select value+1 as v from l where value>=10 order by v desc limit 3',
- 'select count(*),sum(value) from l'
+ 'select count(*),sum(value) from l',
+ 'select count(*) as n from l where value>2',
+ 'select count(*) as n from l join r on l.id=r.id'
 )
 foreach ($n in @(0,35)) {
  foreach ($sql in $queries) {

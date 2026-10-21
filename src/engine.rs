@@ -190,7 +190,13 @@ impl Engine {
                         .iter()
                         .map(|(e, _)| e.evaluate(&batch)?.into_array(batch.num_rows()))
                         .collect::<Result<Vec<_>>>()?;
-                    Ok(RecordBatch::try_new(projection.schema(), columns)?)
+                    let options = datafusion::arrow::record_batch::RecordBatchOptions::new()
+                        .with_row_count(Some(batch.num_rows()));
+                    Ok(RecordBatch::try_new_with_options(
+                        projection.schema(),
+                        columns,
+                        &options,
+                    )?)
                 })
                 .collect();
         }

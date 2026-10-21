@@ -81,6 +81,8 @@ async fn differential_queries_and_parallel_workers() {
         for sql in [
             "select * from l",
             "select count(*) as n from l",
+            "select count(*) as n from l where value>20",
+            "select count(*) as n from l join r on l.id=r.id",
             "select 1 as n",
             "select value+1 as next from l where value>=20 order by next desc limit 2 offset 1",
             "select l.id,l.category,l.value,r.value as rv from l join r on l.id=r.id and l.category=r.category",

@@ -15,7 +15,7 @@ use crate::helper::Entry;
 use crate::physical_operator::{IntermediateOperator, PhysicalOperator, Sink};
 use ahash::RandomState;
 use datafusion::arrow::compute;
-use datafusion::common::hash_utils::create_hashes;
+use datafusion::common::ScalarValue;
 
 pub struct JoinLeftData {
     pub hash_table: GroupedRowHashMap,
@@ -146,29 +146,32 @@ impl IntermediateOperator for HashJoinProbeOperator {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let mut hashes_buffer: Vec<u64> = Vec::new();
-        hashes_buffer.resize(num_rows, 0);
-        let hash_values = create_hashes(
-            &keys_values,
-            &join_left_data.random_state,
-            &mut hashes_buffer,
+        let combined = compute::concat_batches(
+            &self.left_side_schema,
+            join_left_data.originals.iter().map(|b| b.as_ref()),
         )
         .unwrap();
-
-        let num_left_batches = join_left_data.originals.len();
-        let mut left_indices_vec: Vec<Vec<u64>> = Vec::new();
-        left_indices_vec.resize(num_left_batches, Vec::new());
-        let mut right_indices_vec: Vec<u64> = Vec::new();
+        let mut offsets = Vec::new();
+        let mut offset = 0;
+        for batch in &join_left_data.originals {
+            offsets.push(offset);
+            offset += batch.num_rows() as u64;
+        }
+        let mut left_indices_vec = Vec::new();
+        let mut right_indices_vec = Vec::new();
         for right_row_idx in 0..num_rows {
-            let hashmap_key = hash_values[right_row_idx];
-            match join_left_data.hash_table.get(&hashmap_key) {
-                Some(left_row_list) => {
-                    for (batch_id, left_row_idx) in &left_row_list.row_list {
-                        left_indices_vec[*batch_id].push(*left_row_idx);
-                        right_indices_vec.push(right_row_idx as u64);
-                    }
+            let key = keys_values
+                .iter()
+                .map(|a| ScalarValue::try_from_array(a, right_row_idx).unwrap())
+                .collect::<Vec<_>>();
+            if key.iter().any(ScalarValue::is_null) {
+                continue;
+            }
+            if let Some(matches) = join_left_data.hash_table.get(&key) {
+                for (batch_id, row) in &matches.row_list {
+                    left_indices_vec.push(offsets[*batch_id] + row);
+                    right_indices_vec.push(right_row_idx as u64);
                 }
-                None => {}
             }
         }
         if right_indices_vec.is_empty() {
@@ -180,28 +183,10 @@ impl IntermediateOperator for HashJoinProbeOperator {
         let mut columns: Vec<Arc<dyn Array>> =
             Vec::with_capacity(self.output_schema.fields().len());
 
-        let num_left_columns = self.left_side_schema.fields().len();
-        for left_col_idx in 0..num_left_columns {
-            let mut col_fragments = Vec::new();
-            for batch_id in 0..num_left_batches {
-                if left_indices_vec[batch_id].is_empty() {
-                    continue;
-                }
-                //let left_indices = UInt64Array::from(std::mem::take(&mut left_indices_vec[batch_id]));
-                let left_indices = UInt64Array::from(left_indices_vec[batch_id].clone());
-                let col_fragment = compute::take(
-                    join_left_data.originals[batch_id].column(left_col_idx),
-                    &left_indices,
-                    None,
-                )
-                .unwrap();
-                col_fragments.push(col_fragment);
-            }
-            let col_fragments_ref = col_fragments.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-            let left_col = compute::concat(&col_fragments_ref[..]).unwrap();
-            columns.push(left_col);
+        let left_indices = UInt64Array::from(left_indices_vec);
+        for column in combined.columns() {
+            columns.push(compute::take(column, &left_indices, None).unwrap());
         }
-
         let right_indices = UInt64Array::from(right_indices_vec);
         for right_col in input.columns() {
             let new_col = compute::take(right_col, &right_indices, None).unwrap();

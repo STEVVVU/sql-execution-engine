@@ -19,6 +19,7 @@ pub struct HashAggregateOperator {
     group_by_expr: Vec<Arc<dyn PhysicalExpr>>,
 
     out_schema: Arc<Schema>,
+    input_schema: Arc<Schema>,
 
     //keeps the original batches before grouping
     originals: Vec<RecordBatch>,
@@ -41,7 +42,7 @@ impl HashAggregateOperator {
             fields.push(Field::new(
                 name,
                 expr.data_type(&input_schema).unwrap(),
-                false,
+                true,
             ));
         }
         for expr in &aggregate_expr {
@@ -56,6 +57,7 @@ impl HashAggregateOperator {
             aggregate_expr,
             group_by_expr: group_by_expr_only,
             out_schema,
+            input_schema: input_schema.clone(),
             originals: Vec::new(),
             batch_id: 0,
             hash_table: Default::default(),
@@ -86,6 +88,17 @@ impl Sink for HashAggregateOperator {
     }
 
     fn finalize(&mut self) -> Entry {
+        if self.group_by_expr.is_empty() && self.hash_table.is_empty() {
+            self.hash_table.insert(
+                vec![],
+                crate::common::row_hashmap::GroupedRowList { row_list: vec![] },
+            );
+        }
+        if self.hash_table.is_empty() {
+            return Entry::Batch(vec![Arc::new(RecordBatch::new_empty(
+                self.out_schema.clone(),
+            ))]);
+        }
         let num_output_rows = self.hash_table.len();
         let mut columns = Vec::with_capacity(self.group_by_expr.len() + self.aggregate_expr.len());
 
@@ -95,13 +108,22 @@ impl Sink for HashAggregateOperator {
                 .hash_table
                 .iter()
                 .map(|(_, grouped_row_lists)| {
+                    if grouped_row_lists.row_list.is_empty() {
+                        return RecordBatch::new_empty(self.input_schema.clone());
+                    }
                     let (batch_id, row_id) = grouped_row_lists.row_list[0];
                     self.originals[batch_id].slice(row_id as usize, 1)
                 })
                 .collect::<Vec<_>>();
-            let representative_batch =
-                compute::concat_batches(&self.originals[0].schema(), &representative_rows_vec)
-                    .unwrap();
+            let representative_batch = compute::concat_batches(
+                &self
+                    .originals
+                    .first()
+                    .map(|b| b.schema())
+                    .unwrap_or_else(|| self.input_schema.clone()),
+                &representative_rows_vec,
+            )
+            .unwrap();
             for group_by in &self.group_by_expr {
                 let group_by_column = group_by
                     .evaluate(&representative_batch)

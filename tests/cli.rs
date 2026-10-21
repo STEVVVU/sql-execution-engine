@@ -50,7 +50,7 @@ fn cli_emits_csv_and_machine_metrics() {
         "category,n\na,5\nb,5\n"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("\"mode\":\"vectorloom\""));
+    assert!(stderr.contains("\"mode\":\"custom\""));
     assert!(stderr.contains("\"tasks\":2"));
     assert!(stderr.contains("\"worker_ids\":[\"ThreadId("));
 }

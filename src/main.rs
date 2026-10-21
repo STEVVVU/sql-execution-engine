@@ -17,7 +17,7 @@ async fn main() {
 async fn run() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.is_empty() || args.iter().any(|a| a == "--help") {
-        println!("Vectorloom SQL\n--sql SQL [--workers 1..32] [--batch-size N] [--synthetic N]\n[--csv NAME=PATH] [--parquet NAME=PATH] [--reference]\nSynthetic input creates tables l and r with id, category, value. Output is CSV; metrics and physical plan are on stderr.");
+        println!("SQL execution engine\n--sql SQL [--workers 1..32] [--batch-size N] [--synthetic N]\n[--csv NAME=PATH] [--parquet NAME=PATH] [--reference]\nSynthetic input creates tables l and r with id, category, value. Output is CSV; metrics and physical plan are on stderr.");
         return Ok(());
     }
     let mut sql = None;
@@ -191,7 +191,7 @@ async fn run() -> Result<()> {
         if reference {
             "datafusion-reference"
         } else {
-            "vectorloom"
+            "custom"
         },
         rows,
         engine.metrics.tasks,

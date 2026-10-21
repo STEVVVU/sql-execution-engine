@@ -1,4 +1,4 @@
-# Vectorloom development
+# SQL execution engine development
 
 Use `cargo build --locked --jobs 2`, `cargo test --locked --jobs 2`, `cargo fmt --all -- --check`, and `pwsh -NoProfile -File scripts/verify.ps1`. The CLI is `cargo run --locked -- --help`. Development/test profiles disable debug symbols to bound disk use.
 

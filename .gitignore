@@ -4,3 +4,4 @@
 /*.log
 *.pdb
 **/*.rs.bk
+__pycache__/

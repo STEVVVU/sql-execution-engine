@@ -1,0 +1,39 @@
+name: Benchmark
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Ensure syscall profiler is available
+        if: inputs.profile
+        run: command -v strace || { sudo apt-get update && sudo apt-get install -y strace; }
+      - run: cargo build --release --locked --jobs 2
+      - run: cargo test --locked --jobs 2
+      - name: Record toolchain
+        run: |
+          mkdir -p evidence/benchmark-environment
+          { rustc -Vv; cargo -V; uname -a; lscpu; free -b; df -B1 .; uptime; } > evidence/benchmark-environment/environment.txt
+      - name: Measure or profile separately
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          flag=()
+          if [ "$PROFILE" = true ]; then flag+=(--profile); fi
+          python3 scripts/benchmark.py --output evidence/benchmark "${flag[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sql-benchmark-${{ github.run_id }}
+          path: |
+            evidence/benchmark
+            evidence/benchmark-environment

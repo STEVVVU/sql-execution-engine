@@ -15,6 +15,8 @@ Run `target/debug/ee2.exe --help` on Windows or `target/debug/ee2 --help` on Uni
 Run `pwsh -NoProfile -File scripts/verify.ps1`. The maintained driver invokes the public library integration tests and the noninteractive CLI. See features/README.md for the mapped surfaces.
 
 ## Evidence
+For performance work, build `cargo build --release --locked --jobs 2`, then run `python3 scripts/benchmark.py --output evidence/benchmark` on an isolated Linux host. The workflow `.github/workflows/benchmark.yml` retains the full dataset/query/config manifest, raw samples, output digests, plans, wall time, and per-command GNU-time resources. Run `--smoke --sizes 1000 --repeats 1` only to prove setup. Run `--profile` into a different output directory for diagnostics. Inspect the real operator/source limiter before acting on an apparent difference. The regular CLI driver also checks the explicit `--reference-tuned` DataFusion default planner path.
+
 The driver writes timestamped command transcripts and exit codes under ignored `evidence/`. Tests must assert resulting values. CLI comparisons use an explicit DataFusion reference execution and compare parsed rows, preserving duplicates. Logs must survive cleanup. Record unsupported features as limitations instead of silently running the oracle.
 
 ## Cleanup

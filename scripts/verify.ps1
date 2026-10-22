@@ -31,6 +31,8 @@ foreach ($n in @(0,35)) {
   & $binary --synthetic $n --batch-size 3 --sql $sql --reference 1> $reference 2> "$reference.metrics"
   if ($LASTEXITCODE -ne 0) { throw "Reference failed: $sql" }
   if ((Get-Content $out -Raw) -cne (Get-Content $reference -Raw)) { throw "Differential CLI mismatch: $sql" }
+  & $binary --synthetic $n --batch-size 3 --workers 4 --sql $sql --reference-tuned 1> "$reference.tuned" 2> "$reference.tuned.metrics"
+  if ($LASTEXITCODE -ne 0 -or (Get-Content $out -Raw) -cne (Get-Content "$reference.tuned" -Raw)) { throw "Tuned reference mismatch: $sql" }
   "CLI passed synthetic=$n query=$index output=$out" | Tee-Object -FilePath $proof -Append
  }
 }

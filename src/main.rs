@@ -17,17 +17,19 @@ async fn main() {
 async fn run() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.is_empty() || args.iter().any(|a| a == "--help") {
-        println!("SQL execution engine\n--sql SQL [--workers 1..32] [--batch-size N] [--synthetic N]\n[--csv NAME=PATH] [--parquet NAME=PATH] [--reference]\nSynthetic input creates tables l and r with id, category, value. Output is CSV; metrics and physical plan are on stderr.");
+        println!("SQL execution engine\n--sql SQL [--workers 1..32] [--batch-size N] [--synthetic N]\n[--csv NAME=PATH] [--parquet NAME=PATH] [--reference | --reference-tuned]\nSynthetic input creates tables l and r with id, category, value. Output is CSV; metrics and physical plan are on stderr. Tuned reference uses DataFusion defaults with --workers target partitions.");
         return Ok(());
     }
     let mut sql = None;
     let (mut workers, mut batch_size, mut synthetic) = (4, 1024, None);
     let (mut reference, mut tables) = (false, Vec::new());
+    let mut tuned_reference = false;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        if arg == "--reference" {
+        if arg == "--reference" || arg == "--reference-tuned" {
             reference = true;
+            tuned_reference |= arg == "--reference-tuned";
             i += 1;
             continue;
         }
@@ -77,6 +79,13 @@ async fn run() -> Result<()> {
         .set_bool("datafusion.optimizer.repartition_aggregations", false)
         .set_bool("datafusion.optimizer.repartition_joins", false)
         .set_bool("datafusion.execution.coalesce_batches", false);
+    let config = if tuned_reference {
+        SessionConfig::new()
+            .with_target_partitions(workers)
+            .with_batch_size(batch_size)
+    } else {
+        config
+    };
     let ctx = SessionContext::new_with_config(config);
     if let Some(n) = synthetic {
         let schema = Arc::new(Schema::new(vec![

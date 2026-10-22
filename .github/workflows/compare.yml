@@ -10,6 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt
       - name: Install verified native benchmark binary
         run: |
           curl --fail --location --retry 0 -o "$RUNNER_TEMP/hyperfine.tar.gz" https://github.com/sharkdp/hyperfine/releases/download/v2.0.0/hyperfine-v2.0.0-x86_64-unknown-linux-gnu.tar.gz

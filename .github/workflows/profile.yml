@@ -1,0 +1,29 @@
+name: Profile frozen SQL join
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  CARGO_PROFILE_RELEASE_DEBUG: 1
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Install bounded diagnostic tool
+        run: command -v valgrind || { sudo apt-get update && sudo apt-get install -y valgrind; }
+      - run: cargo +1.99.1 build --release --locked --jobs 2
+      - name: Record profile environment
+        run: |
+          mkdir -p evidence/profile-environment
+          { git rev-parse HEAD; rustc +1.99.1 -Vv; cargo +1.99.1 -V; uname -a; lscpu; free -b; df -B1 .; uptime; valgrind --version; } > evidence/profile-environment/environment.txt
+      - run: python3 scripts/profile.py --output evidence/callgrind
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sql-callgrind-${{ github.run_id }}
+          path: |
+            evidence/callgrind
+            evidence/profile-environment

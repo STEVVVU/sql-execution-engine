@@ -27,19 +27,20 @@ jobs:
           cargo +1.99.1 build --release --locked --jobs 2
           mkdir -p "$RUNNER_TEMP/sql-binaries"
           cp target/release/ee2 "$RUNNER_TEMP/sql-binaries/candidate"
-      - name: Build frozen baseline using the same toolchain and target
+      - name: Build frozen baseline using the same toolchain and an independent target
         run: |
           git fetch --depth=1 origin 1f73fcafb08c869f03c1b94cb922222c3c352543
           mkdir -p "$RUNNER_TEMP/sql-baseline"
-          git archive 1f73fcafb08c869f03c1b94cb922222c3c352543 | tar -x -C "$RUNNER_TEMP/sql-baseline"
-          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo +1.99.1 build --release --locked --jobs 2 --manifest-path "$RUNNER_TEMP/sql-baseline/Cargo.toml"
-          cp target/release/ee2 "$RUNNER_TEMP/sql-binaries/baseline"
+          git archive --format=tar --output="$RUNNER_TEMP/sql-baseline.tar" 1f73fcafb08c869f03c1b94cb922222c3c352543
+          tar -xf "$RUNNER_TEMP/sql-baseline.tar" -C "$RUNNER_TEMP/sql-baseline"
+          cargo +1.99.1 build --release --locked --jobs 2 --manifest-path "$RUNNER_TEMP/sql-baseline/Cargo.toml" --target-dir "$RUNNER_TEMP/sql-baseline-target"
+          cp "$RUNNER_TEMP/sql-baseline-target/release/ee2" "$RUNNER_TEMP/sql-binaries/baseline"
       - name: Record paired environment
         run: |
           mkdir -p evidence/compare-environment
           { git rev-parse HEAD; rustc +1.99.1 -Vv; cargo +1.99.1 -V; hyperfine --version; sha256sum "$RUNNER_TEMP/sql-binaries/"*; uname -a; lscpu; free -b; df -B1 .; uptime; } > evidence/compare-environment/environment.txt
       - name: Full frozen matrix with exact output oracle
-        run: python3 scripts/compare.py --baseline-binary "$RUNNER_TEMP/sql-binaries/baseline" --candidate-binary "$RUNNER_TEMP/sql-binaries/candidate" --output evidence/compare
+        run: python3 scripts/compare.py --baseline-binary "$RUNNER_TEMP/sql-binaries/baseline" --baseline-source "$RUNNER_TEMP/sql-baseline" --baseline-archive "$RUNNER_TEMP/sql-baseline.tar" --candidate-binary "$RUNNER_TEMP/sql-binaries/candidate" --output evidence/compare
       - uses: actions/upload-artifact@v4
         if: always()
         with:

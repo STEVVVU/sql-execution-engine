@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import os
 from pathlib import Path
 import shlex
 import shutil
@@ -16,6 +17,8 @@ BASELINE = "1f73fcafb08c869f03c1b94cb922222c3c352543"
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-binary", type=Path, required=True)
+    parser.add_argument("--baseline-source", type=Path, required=True)
+    parser.add_argument("--baseline-archive", type=Path, required=True)
     parser.add_argument("--candidate-binary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -32,11 +35,24 @@ def main():
         "candidate_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "binary_sha256": {name: digest(binary) for name, binary in binaries.items()},
         "hyperfine_version": version,
+        "baseline_archive_sha256": digest(args.baseline_archive),
+        "source_sha256": {build: {name: digest(source / name) for name in ["src/engine.rs", "Cargo.toml", "Cargo.lock"]} for build, source in [("baseline", args.baseline_source), ("candidate", ROOT)]},
+        "build_identity": {
+            "rustc": subprocess.check_output(["rustc", "+1.99.1", "-Vv"], text=True),
+            "cargo": subprocess.check_output(["cargo", "+1.99.1", "-V"], text=True).strip(),
+            "common_arguments": ["+1.99.1", "build", "--release", "--locked", "--jobs", "2"],
+            "environment": {name: value for name, value in os.environ.items() if name in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTUP_TOOLCHAIN", "CARGO_INCREMENTAL"] or name.startswith("CARGO_PROFILE_RELEASE_")},
+            "target_policy": "Independent baseline target directory; matching Cargo manifests/lockfiles and shared compiler/environment on the same host.",
+        },
         "frozen_oracle_sha256": digest(ROOT / "scripts/frozen-benchmark.json"),
         "policy": "Same-runner release builds. Original full matrix: 3 sizes, 5 queries, custom1/custom4/tuned DataFusion4 on both builds. One excluded warmup then five reversed-order rounds. Hyperfine --runs 1 native schema2 exports; no custom timer or statistics. A shell exec, GNU time, file output and CLI startup/decode/plan/execution are included equally on both sides. OS cache warm; no spill. All CSV outputs checked against original campaign digests.",
         "samples": [], "passed": False, "scratch_removed": False,
     }
     try:
+        assert len(set(manifest["binary_sha256"].values())) == 2, "baseline and candidate binaries are identical; use independent build targets"
+        for name in ["Cargo.toml", "Cargo.lock"]:
+            assert manifest["source_sha256"]["baseline"][name] == manifest["source_sha256"]["candidate"][name], f"unmatched dependency/profile input: {name}"
+        assert manifest["source_sha256"]["baseline"]["src/engine.rs"] != manifest["source_sha256"]["candidate"]["src/engine.rs"], "engine sources do not contain the intended change"
         with tempfile.TemporaryDirectory(prefix="vectorloom-compare-") as scratch:
             work = Path(scratch)
             for size, fixture in frozen["cases"].items():

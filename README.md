@@ -33,6 +33,12 @@ Outer/semi/anti/cross joins, residual join filters, null-equal joins, windows, u
 
 ## Verify
 
+The [initial hosted baseline](docs/benchmarks/2026-10-22-baseline.md) retains all five analytical queries and all three data sizes. At one million fact rows, the dimension join took 559.65 ms [555.77, 594.28] with one custom worker, 792.40 ms [777.84, 794.96] with four, and 71.75 ms [70.79, 71.90] with DataFusion. These are medians and min/max of five alternating measurements on a four-logical-CPU AMD EPYC 7763 Ubuntu runner using Rust 1.99.1 release builds. Peak process RSS reached 372.64/371.86/59.17 MiB respectively. All 270 invocations returned matching results without errors. The whole CLI path includes disk CSV decoding and output consumption. A separate Callgrind profile is pending to identify the limiter before changing the executor; no optimization win is claimed.
+
+For an isolated Linux release comparison, run `cargo build --release --locked --jobs 2` and `python3 scripts/benchmark.py --output evidence/benchmark`. The manual [benchmark workflow](.github/workflows/benchmark.yml) runs five alternating repetitions over 1,000, 100,000 and 1,000,000 disk CSV rows. It compares one/four custom workers with `--reference-tuned`, which uses DataFusion defaults, four target partitions and the same 8192-row batch size. The original `--reference` retains its constrained differential-planner configuration.
+
+The benchmark records whole CLI wall time, including startup, file decoding, planning, execution and consumed CSV output, plus peak RSS, exact result digests, fixture hashes, plans and raw samples. A warmup precedes each comparison. Its separate profile mode is diagnostic. These drivers establish a reproducible measurement path; setup smoke timings are not performance results. The engine remains in memory with no spill.
+
 ```powershell
 cargo fmt --all -- --check
 cargo test --locked --jobs 2

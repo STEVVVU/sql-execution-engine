@@ -1,0 +1,42 @@
+{
+  "source": "58adbf2f82acc2df2375615d6b941d5d06a11364",
+  "queries": {
+    "scan_sum": "select sum(value) as total,count(*) as n from facts",
+    "selective": "select count(*) as n,sum(value) as total from facts where value>=990",
+    "grouped": "select category,count(*) as n,sum(value) as total from facts group by category order by category",
+    "topk": "select id,value from facts order by value desc,id limit 100",
+    "dimension_join": "select d.category,count(*) as n,sum(f.value) as total from facts f join dimension d on f.category=d.category group by d.category order by d.category"
+  },
+  "cases": {
+    "1000": {
+      "facts_sha256": "5ec048b8fd5e6f15d6a77a83f54b6af142e26231b9957e95ee351cd575114efe",
+      "outputs": {
+        "scan_sum": "58ddf714e99677112eda525e734d28a81d6f0b9f24a3753ef117ac14c90f9e2b",
+        "selective": "ce0e6cf7fd67eef51e010d9e30730daf2e24fa4f68a088063266996c25ac970c",
+        "grouped": "a9eaed65cf3a951a82e8ca0a6f915f316c5b0c2496f8cd1ecac4ae9826d8428a",
+        "topk": "4da08196a412ce77c77af4878ace4034e280a939d166be2e7d481dcb4ca54985",
+        "dimension_join": "a9eaed65cf3a951a82e8ca0a6f915f316c5b0c2496f8cd1ecac4ae9826d8428a"
+      }
+    },
+    "100000": {
+      "facts_sha256": "43957c70963b20d63471fc2c21713552d0062580ed8d765596bf3e9d4fbf468c",
+      "outputs": {
+        "scan_sum": "197f3fd246ce4d177db50afef6812f81b84dfb9ee9a013c6b0c7c5635d019472",
+        "selective": "e6fea55156d9c1398fdf5942157974813f7962fa6b9db837f5187660740402c3",
+        "grouped": "e645c4ed1153beb934d1636714f4095036d6be6d3beb9975c041af5500ec3139",
+        "topk": "1af84cf7c86a04ec51dc4b472bbf35c6ea8f49303fabc111dc66f385496da8ff",
+        "dimension_join": "e645c4ed1153beb934d1636714f4095036d6be6d3beb9975c041af5500ec3139"
+      }
+    },
+    "1000000": {
+      "facts_sha256": "c6ab3b4bbb04710bd63dcca3036435f1fd85d864dfaa4f5786a3c8cfcc146d60",
+      "outputs": {
+        "scan_sum": "556343082c69e842f12b830623f3e07063a2bfaf51057030b382eb3f9a3e9c95",
+        "selective": "d3725e617e7f6a38e5fa134c88815b42072d818da9af997866a0881871c3e860",
+        "grouped": "7144b645c8589fdad95b4252e9674a5eae2e5c9b7d7bf293296e30128a897bb9",
+        "topk": "1af84cf7c86a04ec51dc4b472bbf35c6ea8f49303fabc111dc66f385496da8ff",
+        "dimension_join": "7144b645c8589fdad95b4252e9674a5eae2e5c9b7d7bf293296e30128a897bb9"
+      }
+    }
+  }
+}

@@ -11,7 +11,6 @@ use datafusion::physical_plan::{
     ExecutionPlan,
 };
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Barrier,
@@ -50,10 +49,8 @@ fn key(arrays: &[ArrayRef], row: usize) -> Result<Key> {
         .collect()
 }
 
-fn partition(key: &Key, workers: usize) -> usize {
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hash);
-    hash.finish() as usize % workers
+fn partition(key: &Key, workers: usize, hash_state: &ahash::RandomState) -> usize {
+    hash_state.hash_one(key) as usize % workers
 }
 
 fn select(batch: &RecordBatch, rows: Vec<u64>) -> Result<RecordBatch> {
@@ -251,6 +248,7 @@ impl Engine {
         )?;
         let mut builds = vec![Vec::new(); self.workers];
         let mut probes = vec![Vec::new(); self.workers];
+        let hash_state = ahash::RandomState::new();
         for (batch, arrays, partitions) in [
             (&left, &left_keys, &mut builds),
             (&right, &right_keys, &mut probes),
@@ -260,7 +258,7 @@ impl Engine {
                 if key.iter().any(ScalarValue::is_null) {
                     continue;
                 }
-                partitions[partition(&key, self.workers)].push((key, row as u64));
+                partitions[partition(&key, self.workers, &hash_state)].push((key, row as u64));
             }
         }
         let barrier = Arc::new(Barrier::new(self.workers));
@@ -271,11 +269,12 @@ impl Engine {
                 .into_iter()
                 .zip(probes)
                 .map(|(build, probe)| {
+                    let hash_state = hash_state.clone();
                     let (left, right, schema, barrier, output_rows) =
                         (&left, &right, schema.clone(), barrier.clone(), &output_rows);
                     scope.spawn(move || -> Result<_> {
                         barrier.wait();
-                        let mut map: HashMap<Key, Vec<u64>> = HashMap::new();
+                        let mut map: HashMap<Key, Vec<u64>, _> = HashMap::with_hasher(hash_state);
                         for (key, row) in build {
                             map.entry(key).or_default().push(row);
                         }
@@ -349,11 +348,13 @@ impl Engine {
             .collect();
         let group_count = exprs.len();
         let arrays = values(&exprs, &batch)?;
-        let mut partitions: Vec<HashMap<Key, Vec<u64>>> =
-            (0..self.workers).map(|_| HashMap::new()).collect();
+        let hash_state = ahash::RandomState::new();
+        let mut partitions: Vec<HashMap<Key, Vec<u64>, _>> = (0..self.workers)
+            .map(|_| HashMap::with_hasher(hash_state.clone()))
+            .collect();
         for row in 0..batch.num_rows() {
             let key = key(&arrays, row)?;
-            partitions[partition(&key, self.workers)]
+            partitions[partition(&key, self.workers, &hash_state)]
                 .entry(key)
                 .or_default()
                 .push(row as u64);

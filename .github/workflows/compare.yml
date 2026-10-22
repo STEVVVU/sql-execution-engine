@@ -1,0 +1,48 @@
+name: Compare frozen SQL with Hyperfine
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Install verified native benchmark binary
+        run: |
+          curl --fail --location --retry 0 -o "$RUNNER_TEMP/hyperfine.tar.gz" https://github.com/sharkdp/hyperfine/releases/download/v2.0.0/hyperfine-v2.0.0-x86_64-unknown-linux-gnu.tar.gz
+          echo 'ae2beda2ac99c098427e4f755244552daf20e514422889cca6d44421e2d93c87  '"$RUNNER_TEMP/hyperfine.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/hyperfine"
+          tar -xzf "$RUNNER_TEMP/hyperfine.tar.gz" -C "$RUNNER_TEMP/hyperfine" --strip-components=1
+          echo "$RUNNER_TEMP/hyperfine" >> "$GITHUB_PATH"
+      - name: Build candidate and run existing correctness checks
+        run: |
+          cargo +1.99.1 fmt --all -- --check
+          cargo +1.99.1 build --locked --jobs 2
+          RUSTUP_TOOLCHAIN=1.99.1 pwsh -NoProfile -File scripts/verify.ps1
+          cargo +1.99.1 build --release --locked --jobs 2
+          mkdir -p "$RUNNER_TEMP/sql-binaries"
+          cp target/release/ee2 "$RUNNER_TEMP/sql-binaries/candidate"
+      - name: Build frozen baseline using the same toolchain and target
+        run: |
+          git fetch --depth=1 origin 1f73fcafb08c869f03c1b94cb922222c3c352543
+          mkdir -p "$RUNNER_TEMP/sql-baseline"
+          git archive 1f73fcafb08c869f03c1b94cb922222c3c352543 | tar -x -C "$RUNNER_TEMP/sql-baseline"
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo +1.99.1 build --release --locked --jobs 2 --manifest-path "$RUNNER_TEMP/sql-baseline/Cargo.toml"
+          cp target/release/ee2 "$RUNNER_TEMP/sql-binaries/baseline"
+      - name: Record paired environment
+        run: |
+          mkdir -p evidence/compare-environment
+          { git rev-parse HEAD; rustc +1.99.1 -Vv; cargo +1.99.1 -V; hyperfine --version; sha256sum "$RUNNER_TEMP/sql-binaries/"*; uname -a; lscpu; free -b; df -B1 .; uptime; } > evidence/compare-environment/environment.txt
+      - name: Full frozen matrix with exact output oracle
+        run: python3 scripts/compare.py --baseline-binary "$RUNNER_TEMP/sql-binaries/baseline" --candidate-binary "$RUNNER_TEMP/sql-binaries/candidate" --output evidence/compare
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sql-hyperfine-${{ github.run_id }}
+          path: |
+            evidence/compare
+            evidence/compare-environment
+            evidence/verify-*

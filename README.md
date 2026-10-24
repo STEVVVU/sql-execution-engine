@@ -1,5 +1,12 @@
 # SQL execution engine
 
+## Contents
+
+- [Architecture and execution guide](#architecture-and-execution-guide)
+- [Run](#run)
+- [Execution and limits](#execution-and-limits)
+- [Verify](#verify)
+
 This project is a bounded, noninteractive SQL runner built on the complete MIT-licensed CMU 15-721 Spring 2024 Execution Engine #2 capstone. The original Arrow operators, tests, data, and Git history remain here. This adaptation adds a usable CLI, an explicit custom physical-plan executor, exact-key joins/grouping, parallel partition workers, and differential verification. It is a portfolio adaptation, not a claim of original authorship or course completion.
 
 Upstream is [cmu-db/15721-s24-ee2](https://github.com/cmu-db/15721-s24-ee2), baseline `4272268d129455f0e3059d27fe731748674bd3cd`, listed as Execution Engine #2 on the [official project showcase](https://15721.courses.cs.cmu.edu/spring2024/project-showcase.html). Preserve [LICENSE](LICENSE) and [README.upstream.md](README.upstream.md).
@@ -18,6 +25,141 @@ cargo run --locked -- --csv items=items.csv --sql "select id,count(*) from items
 `--help` lists arguments. `--synthetic N` registers `l` and `r`, each with nullable repeating `id`, string `category`, and integer `value`. `--batch-size` controls synthetic batches and planner batch size. CSV uses a header and inferred types. Parquet uses its embedded schema. Multiple `--csv` and `--parquet` registrations are supported. Each command executes one SQL query and exits. Errors use a nonzero exit status.
 
 Stdout is CSV with headers, quoting via the csv crate, and empty fields for nulls. Empty strings and nulls share that CSV representation. Stderr contains the physical plan and `mode`, `rows`, `tasks`, `worker_ids`, and `elapsed_us`. The final stderr line is JSON metrics. Timing is diagnostic only, with no performance claim. Hash output order is unspecified without `ORDER BY`.
+
+## Architecture and execution guide
+
+The inherited CMU capstone supplies Arrow operators, tests, and the original serial pipeline. DataFusion supplies SQL parsing, optimization, physical planning, expressions, CSV and Parquet decoding, and the explicit reference executor. The added CLI registers input tables and uses the custom owned executor by default or the explicitly requested DataFusion reference path. The preserved serial pipeline remains a separate library path. The custom executor does not silently fall back for unsupported nodes.
+
+This boundary map shows the CLI, DataFusion planning boundary, and the two explicitly selectable execution paths.
+
+```mermaid
+flowchart LR
+    input["CLI SQL and CSV, Parquet, or synthetic tables"] --> ctx["DataFusion session and physical plan"]
+    ctx --> select["Execution mode"]
+    select --> custom["Custom Engine physical-plan walker"]
+    select --> reference["Explicit DataFusion reference mode"]
+    custom --> arrow["Arrow record batches"]
+    reference --> arrow
+    arrow --> output["CSV stdout and plan/metrics stderr"]
+```
+
+The DataFusion planner creates the physical plan for both modes. In custom mode, `Engine` recognizes supported nodes and executes operators over Arrow record batches. In reference mode, DataFusion executes the planned query. The upstream `Pipeline` remains a separate serial path used by preserved library code; it is not the custom parallel executor.
+
+This flow shows table registration, plan validation, custom execution, and the explicit unsupported-plan error boundary.
+
+```mermaid
+flowchart TD
+    subgraph CLI["CLI input boundary"]
+        args["Parse flags and enforce input limits"] --> tables["Register synthetic, CSV, or Parquet tables"]
+        tables --> sql["Require one SELECT query"]
+    end
+    subgraph Planner["DataFusion planning"]
+        sql --> logical["Parse and optimize SQL"] --> physical["Create physical plan"]
+    end
+    subgraph Executor["Selected execution path"]
+        physical --> mode{"Reference requested?"}
+        mode -->|"yes"| df["DataFusion executes plan"]
+        mode -->|"no"| walk["Engine walks supported plan nodes"]
+        walk --> operators["Scan, filter, projection, join, aggregate, sort, limit"]
+        walk -->|"unsupported node or row cap"| error["Return explicit error"]
+    end
+    df --> rows["Collect result batches"]
+    operators --> rows
+    rows --> csv["Write CSV and stderr metrics"]
+    error --> stderr["Nonzero exit and error on stderr"]
+```
+
+Hash joins and grouped aggregates in the custom engine partition complete keys across owned workers. A barrier joins worker tasks before output collection. Row caps apply to the custom path; the reference path is an explicit verification oracle and bypasses those custom caps. CSV represents both null and empty string as an empty field.
+
+| Subsystem | Responsibility | Owned state or invariant | Source |
+| --- | --- | --- | --- |
+| CLI and table registration | Validate flags and register synthetic, CSV, and Parquet inputs | One SELECT statement; bounded SQL, input, worker, and batch settings | [`src/main.rs`](src/main.rs) |
+| DataFusion planner | Parse and optimize SQL into a physical plan | Plan node types determine whether custom execution is supported | [`src/main.rs`](src/main.rs) |
+| Custom plan walker | Execute supported physical nodes and reject unknown nodes | One-million-row scan/output cap; no implicit fallback | [`src/engine.rs`](src/engine.rs) |
+| Parallel join and aggregate | Partition complete keys, execute workers, merge Arrow output | Worker range 1..32; key equality remains exact after hashing | [`src/engine.rs`](src/engine.rs) |
+| Preserved operator pipeline | Run inherited source, intermediate operators, and sink serially | Pipeline-local operators and intermediate result store | [`src/parallel/pipeline.rs`](src/parallel/pipeline.rs) |
+| Differential driver | Compare custom CLI output with explicit reference output | Exact CSV comparisons and preserved feature evidence | [`scripts/verify.ps1`](scripts/verify.ps1) |
+
+Terms used in query execution: [physical plan](#concept-physical-plan), [record batch](#concept-record-batch), [Arrow](#concept-arrow), [hash join](#concept-hash-join), [aggregate state](#concept-aggregate-state), [owned partition](#concept-owned-partition), [differential execution](#concept-differential-execution), and [spill](#concept-spill).
+
+### Follow one query
+
+1. Choose an input registration such as `--synthetic 35`, `--csv items=items.csv`, or `--parquet products=data/products.parquet`.
+2. The CLI validates worker count, batch size, SQL length, and that the input contains exactly one SELECT statement.
+3. DataFusion registers table schemas, parses and optimizes the SQL, and builds a physical plan.
+4. By default, `Engine` walks the plan. It executes supported scans, filters, projections, inner equijoins, aggregates, sorts, and limits. It returns an explicit error for an unsupported node.
+5. For join and aggregate work, the engine hashes full scalar keys into worker partitions, runs scoped worker tasks, and combines their Arrow batches. Hash collisions do not replace equality checks.
+6. The CLI writes result rows as CSV to stdout and the plan plus diagnostic metrics to stderr. Use `--reference` only when you want DataFusion's executor as a comparison path.
+
+### Design decisions and limits
+
+These rationales are inferred from the current implementation. They do not record historic design intent.
+
+| Choice | Practical rationale | Alternative and cost | Reconsider when |
+| --- | --- | --- | --- |
+| Let DataFusion parse, optimize, and plan | Reuses established SQL and Arrow expression handling while the project focuses on execution | A custom parser and optimizer would broaden scope and duplicate mature behavior | The project needs to study planning itself |
+| Walk the physical plan explicitly | Makes supported execution behavior visible and fails clearly on unsupported nodes | Implicit fallback is more compatible but can hide which engine ran | The supported set grows and a deliberate dispatch design changes |
+| Keep the original serial pipeline and owned executor separate | Avoids sharing its `RefCell` state across worker threads | Refactoring both into one abstraction would change preserved upstream structure | The serial path is removed or its state becomes safely shareable |
+| Partition complete join and aggregate keys | Keeps all rows for one key together and allows independent worker state | Streaming or shared concurrent maps may reduce memory but add synchronization and skew costs | Memory limits or skew dominate a measured use case |
+| Keep reference execution explicit | Makes differential checks intentional and preserves custom-plan errors | Automatic fallback hides unsupported behavior and comparison mode | A production compatibility contract requires fallback semantics |
+
+### Glossary
+
+<a id="concept-physical-plan"></a>
+
+<details><summary>What is a physical plan?</summary>
+
+A physical plan is the executable operator tree produced after SQL planning. The custom engine supports a bounded set of DataFusion node types and reports an error for others.
+</details>
+
+<a id="concept-record-batch"></a>
+
+<details><summary>What is a record batch?</summary>
+
+A record batch is a columnar group of rows with an Arrow schema. The custom executor passes batches between scan, filter, projection, and output collection steps.
+</details>
+
+<a id="concept-arrow"></a>
+
+<details><summary>What is Arrow?</summary>
+
+Arrow is a columnar memory format and compute library. This engine stores intermediate table data in Arrow record batches and uses Arrow compute operations for filters, sorting, and row selection.
+</details>
+
+<a id="concept-hash-join"></a>
+
+<details><summary>What is a hash join?</summary>
+
+A hash join builds a lookup structure from join keys, then probes it with keys from the other input. Here the custom path supports inner equijoins without residual filters and checks exact key equality after hashing.
+</details>
+
+<a id="concept-aggregate-state"></a>
+
+<details><summary>What is aggregate state?</summary>
+
+Aggregate state holds partial values such as a sum or count while rows are grouped. Workers update independent Arrow accumulators, then combine partial states for supported aggregates.
+</details>
+
+<a id="concept-owned-partition"></a>
+
+<details><summary>What is an owned partition?</summary>
+
+An owned partition is the worker's exclusive subset of keys and rows for a parallel operator. Complete join or group keys are assigned to one partition so workers do not update shared mutable maps.
+</details>
+
+<a id="concept-differential-execution"></a>
+
+<details><summary>What is differential execution?</summary>
+
+Differential execution runs the same query through two implementations and compares results. The CLI's explicit `--reference` mode uses DataFusion as the comparison path for the custom executor.
+</details>
+
+<a id="concept-spill"></a>
+
+<details><summary>What is spill?</summary>
+
+Spill writes intermediate data to disk when memory limits are reached. This engine is in-memory and does not spill; custom scanned tables and outputs are capped at one million rows.
+</details>
 
 ## Execution and limits
 

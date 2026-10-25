@@ -14,6 +14,436 @@ Upstream is [cmu-db/15721-s24-ee2](https://github.com/cmu-db/15721-s24-ee2), bas
 
 ## Architecture and execution guide
 
+<!-- execution-flow:start -->
+### Execution flow
+
+Start with the primary path, then expand a detailed workflow. Select a numbered node to see its operation, implementation techniques, and source. Solid arrows show the named control, data, or lifecycle handoff; dotted arrows show error paths. Separate entry points are named in each workflow.
+
+CLI entry to CSV output. Custom execution is expanded below; explicit reference execution is a separate selected branch.
+
+```mermaid
+flowchart TD
+    n1["1. Validate CLI and SQL"]
+    click n1 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-validate" "Open step, techniques, and source" _top
+    n2["2. Materialize input tables"]
+    click n2 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-load" "Open step, techniques, and source" _top
+    n3["3. Build physical plan"]
+    click n3 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-plan" "Open step, techniques, and source" _top
+    n4["4. Walk custom plan"]
+    click n4 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-dispatch" "Open step, techniques, and source" _top
+    n5["5. Collect explicit reference"]
+    click n5 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-reference" "Open step, techniques, and source" _top
+    n6["6. Serialize CSV and diagnostics"]
+    click n6 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-serialize" "Open step, techniques, and source" _top
+    n7["7. Return error and exit"]
+    click n7 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-fail" "Open step, techniques, and source" _top
+    n1 -->|"valid query and bounds"| n2
+    n2 -->|"registered tables"| n3
+    n3 -->|"default custom mode"| n4
+    n3 -->|"reference flag"| n5
+    n4 -->|"successful batches"| n6
+    n5 -->|"successful batches"| n6
+    n1 -.->|"propagated Result error"| n7
+    n2 -.->|"propagated Result error"| n7
+    n3 -.->|"propagated Result error"| n7
+    n4 -.->|"propagated Result error"| n7
+    n5 -.->|"propagated Result error"| n7
+    n6 -.->|"propagated Result error"| n7
+```
+
+**Detailed workflows.** [Custom plan dispatch and operators](#flow-workflow-custom-walker) · [Partitioned inner join](#flow-workflow-parallel-join) · [Partitioned aggregate state flow](#flow-workflow-parallel-aggregate) · [Preserved serial source/operator/sink path](#flow-workflow-serial-pipeline) · [Separate differential verification driver](#flow-workflow-verification).
+
+<a id="flow-workflow-custom-walker"></a>
+
+<details>
+<summary>Custom plan dispatch and operators</summary>
+
+Each recursive invocation selects a physical node. Child recursion returns its batches before the parent operator runs; branch arrows do not mean every operator runs for every query.
+
+```mermaid
+flowchart TD
+    n4["4. Walk custom plan"]
+    click n4 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-dispatch" "Open step, techniques, and source" _top
+    n8["8. Read leaf batches"]
+    click n8 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-scan" "Open step, techniques, and source" _top
+    n9["9. Execute required children"]
+    click n9 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-children" "Open step, techniques, and source" _top
+    n10["10. Evaluate filter or<br/>projection"]
+    click n10 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-unary" "Open step, techniques, and source" _top
+    n11["11. Sort or slice results"]
+    click n11 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-sort-limit" "Open step, techniques, and source" _top
+    n12["12. Partition typed join keys"]
+    click n12 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-join-partition" "Open step, techniques, and source" _top
+    n15["15. Group rows into partitions"]
+    click n15 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-aggregate-partition" "Open step, techniques, and source" _top
+    n7["7. Return error and exit"]
+    click n7 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-fail" "Open step, techniques, and source" _top
+    n4 -->|"leaf plan"| n8
+    n4 -->|"supported parent node"| n9
+    n9 -->|"recursive child invocation"| n4
+    n9 -->|"filter or projection child returned"| n10
+    n9 -->|"sort or limit child returned"| n11
+    n9 -->|"both join children returned"| n12
+    n9 -->|"aggregate child returned"| n15
+    n4 -.->|"unsupported shape or join"| n7
+    n9 -.->|"unsupported unary after child"| n7
+```
+
+</details>
+
+<a id="flow-workflow-parallel-join"></a>
+
+<details>
+<summary>Partitioned inner join</summary>
+
+The caller materializes children first. Key partitioning is serial; only owned partition build/probe work runs concurrently.
+
+```mermaid
+flowchart TD
+    n12["12. Partition typed join keys"]
+    click n12 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-join-partition" "Open step, techniques, and source" _top
+    n13["13. Build and probe partitions"]
+    click n13 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-join-workers" "Open step, techniques, and source" _top
+    n14["14. Join workers and return<br/>batches"]
+    click n14 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-join-collect" "Open step, techniques, and source" _top
+    n7["7. Return error and exit"]
+    click n7 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-fail" "Open step, techniques, and source" _top
+    n12 -->|"fan out owned partitions"| n13
+    n13 -->|"join all worker handles"| n14
+    n13 -.->|"output cap or Arrow error"| n7
+    n14 -.->|"worker panic or error"| n7
+```
+
+</details>
+
+<a id="flow-workflow-parallel-aggregate"></a>
+
+<details>
+<summary>Partitioned aggregate state flow</summary>
+
+Grouping assignment precedes scoped workers. Partial and final modes use different accumulator methods rather than identical row aggregation.
+
+```mermaid
+flowchart TD
+    n15["15. Group rows into partitions"]
+    click n15 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-aggregate-partition" "Open step, techniques, and source" _top
+    n16["16. Update or merge accumulator<br/>states"]
+    click n16 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-aggregate-workers" "Open step, techniques, and source" _top
+    n17["17. Collect aggregate batches"]
+    click n17 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-aggregate-collect" "Open step, techniques, and source" _top
+    n7["7. Return error and exit"]
+    click n7 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-fail" "Open step, techniques, and source" _top
+    n15 -->|"fan out owned groups"| n16
+    n16 -->|"group outputs then join"| n17
+    n15 -.->|"unsupported aggregate"| n7
+    n16 -.->|"accumulator or Arrow error"| n7
+    n17 -.->|"worker panic or error"| n7
+```
+
+</details>
+
+<a id="flow-workflow-serial-pipeline"></a>
+
+<details>
+<summary>Preserved serial source/operator/sink path</summary>
+
+Independent library entry Pipeline::execute. It is not a downstream stage of the custom CLI executor.
+
+```mermaid
+flowchart TD
+    n18["18. Pull serial source batch"]
+    click n18 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-pipeline-source" "Open step, techniques, and source" _top
+    n19["19. Resume serial operators"]
+    click n19 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-pipeline-operator" "Open step, techniques, and source" _top
+    n20["20. Consume or finish"]
+    click n20 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-pipeline-sink" "Open step, techniques, and source" _top
+    n21["21. Finalize serial entry"]
+    click n21 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-pipeline-finalize" "Open step, techniques, and source" _top
+    n18 -->|"source has batch"| n19
+    n19 -->|"emitted batch / rescheduled input"| n19
+    n19 -->|"index past final operator"| n20
+    n20 -->|"NeedMoreInput and stack remains"| n19
+    n20 -->|"stack drained"| n18
+    n18 -->|"source Finished"| n21
+    n20 -->|"sink Finished"| n21
+```
+
+</details>
+
+<a id="flow-workflow-verification"></a>
+
+<details>
+<summary>Separate differential verification driver</summary>
+
+Verification invokes the CLI modes as subprocesses. These are test actions, not a production execution stage.
+
+```mermaid
+flowchart TD
+    n22["22. Run differential<br/>verification cases"]
+    click n22 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-verify-cases" "Open step, techniques, and source" _top
+    n23["23. Check formats and rejection<br/>paths"]
+    click n23 href "https://github.com/STEVVVU/sql-execution-engine#flow-step-verify-boundaries" "Open step, techniques, and source" _top
+    n22 -->|"differential cases passed"| n23
+```
+
+</details>
+
+#### Steps, techniques, and source
+
+These source traces cover the active scope below. They explain implementation behavior; benchmark results and their limits remain in the measurement sections.
+
+<a id="flow-step-validate"></a>
+
+##### 1. Validate CLI and SQL
+
+**Component.** CLI run. Parse flags and reject invalid bounds, missing SQL, multiple statements, and non-query statements before loading tables. Both reference flags explicitly select DataFusion execution.
+
+**Techniques at this step.** [Decode and register bounded in-memory tables](#technique-bounded-input-materialization).
+
+**Source.** [`src/main.rs:28`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/main.rs#L28) · [`src/main.rs:54`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/main.rs#L54) · [`src/main.rs:67`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/main.rs#L67). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-load"></a>
+
+##### 2. Materialize input tables
+
+**Component.** CLI / DataFusion readers. Create synthetic Arrow batches or read each bounded CSV/Parquet file with DataFusion, collect it, and register a MemTable. File-byte limits precede decoding; the custom scan applies its row bound later.
+
+**Techniques at this step.** [Decode and register bounded in-memory tables](#technique-bounded-input-materialization).
+
+**Source.** [`src/main.rs:91`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/main.rs#L91) · [`src/main.rs:131`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/main.rs#L131) · [`src/main.rs:143`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/main.rs#L143). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-plan"></a>
+
+##### 3. Build physical plan
+
+**Component.** DataFusion SessionContext. Use DataFusion SQL planning. The default configuration disables repartitioning and batch coalescing; the explicitly tuned reference uses DataFusion defaults with the requested target partitions.
+
+**Techniques at this step.** [Delegate SQL parsing, optimization and physical planning](#technique-planner-delegation).
+
+**Source.** [`src/main.rs:76`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/main.rs#L76) · [`src/main.rs:82`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/main.rs#L82) · [`src/main.rs:159`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/main.rs#L159). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-dispatch"></a>
+
+##### 4. Walk custom plan
+
+**Component.** Engine::execute. Dispatch on physical-node types and recurse into supported children. Unsupported joins are rejected before their children; an unknown unary node can execute its child before returning NotImplemented. No implicit reference fallback exists.
+
+**Techniques at this step.** [Dispatch by physical-plan node type](#technique-plan-node-dispatch).
+
+**Source.** [`src/engine.rs:84`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L84) · [`src/engine.rs:134`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L134) · [`src/engine.rs:232`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L232). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-reference"></a>
+
+##### 5. Collect explicit reference
+
+**Component.** DataFusion collect. Only an explicit reference flag sends the physical plan to DataFusion collect. It shares the input registration and CSV serializer with custom execution.
+
+**Techniques at this step.** [Select DataFusion as an explicit comparison oracle](#technique-explicit-reference-oracle).
+
+**Source.** [`src/main.rs:166`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/main.rs#L166). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-serialize"></a>
+
+##### 6. Serialize CSV and diagnostics
+
+**Component.** CLI writer. Write the schema header and row fields; represent null as an empty CSV field. Flush output, then write mode, row count, task count, worker IDs, and diagnostic elapsed time to stderr.
+
+**Techniques at this step.** [Serialize Arrow results as CSV rows](#technique-csv-result-serialization).
+
+**Source.** [`src/main.rs:171`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/main.rs#L171) · [`src/main.rs:179`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/main.rs#L179) · [`src/main.rs:196`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/main.rs#L196). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-fail"></a>
+
+##### 7. Return error and exit
+
+**Component.** CLI main. Planning, I/O, unsupported-plan, resource-limit, Arrow, and worker errors propagate through Result. Main prints the error and exits with status 1; it does not retry with another engine.
+
+Basic control or result handoff; the linked neighboring steps explain its implementation techniques.
+
+**Source.** [`src/main.rs:10`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/main.rs#L10). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-scan"></a>
+
+##### 8. Read leaf batches
+
+**Component.** Engine::execute. Placeholder and empty plans return their defined batches. MemoryExec counts rows, rejects more than one million, then clones or projects registered Arrow batches.
+
+**Techniques at this step.** [Enforce row caps at scan and join output](#technique-bounded-materialization) · [Evaluate expressions and transform Arrow columns](#technique-arrow-columnar-evaluation).
+
+**Source.** [`src/engine.rs:94`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L94) · [`src/engine.rs:111`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L111). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-children"></a>
+
+##### 9. Execute required children
+
+**Component.** Engine::execute. A join executes and concatenates its left child, then its right child. Aggregates execute and concatenate their single child; coalescing nodes delegate directly. Other unary operators first execute their child.
+
+**Techniques at this step.** [Dispatch by physical-plan node type](#technique-plan-node-dispatch) · [Enforce row caps at scan and join output](#technique-bounded-materialization).
+
+**Source.** [`src/engine.rs:145`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L145) · [`src/engine.rs:154`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L154) · [`src/engine.rs:162`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L162). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-unary"></a>
+
+##### 10. Evaluate filter or projection
+
+**Component.** Arrow physical expressions. Filters evaluate a BooleanArray and apply Arrow filtering. Projections evaluate expressions into columns and retain the input row count, including zero-column batches.
+
+**Techniques at this step.** [Evaluate expressions and transform Arrow columns](#technique-arrow-columnar-evaluation).
+
+**Source.** [`src/engine.rs:163`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L163) · [`src/engine.rs:181`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L181). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-sort-limit"></a>
+
+##### 11. Sort or slice results
+
+**Component.** Arrow sort / limit nodes. Sort concatenates batches, computes lexicographic row indices with the optional fetch bound, and gathers columns. Global and local limits concatenate then slice with their respective offset/fetch rules.
+
+**Techniques at this step.** [Sort by Arrow indices and slice limits](#technique-sort-and-limit) · [Enforce row caps at scan and join output](#technique-bounded-materialization).
+
+**Source.** [`src/engine.rs:200`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L200) · [`src/engine.rs:217`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L217) · [`src/engine.rs:228`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L228). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-join-partition"></a>
+
+##### 12. Partition typed join keys
+
+**Component.** Engine::join. Evaluate both sides into typed composite ScalarValue keys. Skip a row when any key is null. Serial partition assignment uses the same ahash state on both sides; partitioning alone does not rebalance skew.
+
+**Techniques at this step.** [Build typed composite keys with exact equality](#technique-typed-composite-keys) · [Exclude null join keys from matches](#technique-null-key-semantics) · [Partition complete keys by hash](#technique-hash-partitioning) · [Reuse ahash for partition and map hashing](#technique-ahash-hashing) · [Trade in-memory partitions for worker-local state](#technique-skew-and-memory-limits).
+
+**Source.** [`src/engine.rs:235`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L235) · [`src/engine.rs:251`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L251) · [`src/engine.rs:255`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L255). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-join-workers"></a>
+
+##### 13. Build and probe partitions
+
+**Component.** Scoped join workers. Spawn one scoped worker per partition and synchronize at a barrier. Each builds a key-to-left-row-list hash table, probes right rows with full key equality, and gathers paired Arrow rows; the shared counter rejects join output beyond one million.
+
+**Techniques at this step.** [Build and probe partition-local hash tables](#technique-parallel-hash-join) · [Run scoped workers with a barrier and collect results](#technique-scoped-worker-execution) · [Enforce row caps at scan and join output](#technique-bounded-materialization).
+
+**Source.** [`src/engine.rs:264`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L264) · [`src/engine.rs:274`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L274) · [`src/engine.rs:285`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L285). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-join-collect"></a>
+
+##### 14. Join workers and return batches
+
+**Component.** Engine::join / record. Join all handles, translate a worker panic into an execution error, propagate worker errors, and record successful task IDs before returning batches.
+
+**Techniques at this step.** [Run scoped workers with a barrier and collect results](#technique-scoped-worker-execution).
+
+**Source.** [`src/engine.rs:306`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L306) · [`src/engine.rs:316`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L316). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-aggregate-partition"></a>
+
+##### 15. Group rows into partitions
+
+**Component.** Engine::aggregate. Reject ordered aggregates, FILTER, and grouping sets. Partition complete typed group keys to row lists using ahash; insert one empty global group when there are no input rows and no grouping expressions.
+
+**Techniques at this step.** [Build typed composite keys with exact equality](#technique-typed-composite-keys) · [Partition complete keys by hash](#technique-hash-partitioning) · [Reuse ahash for partition and map hashing](#technique-ahash-hashing) · [Trade in-memory partitions for worker-local state](#technique-skew-and-memory-limits).
+
+**Source.** [`src/engine.rs:326`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L326) · [`src/engine.rs:350`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L350) · [`src/engine.rs:362`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L362). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-aggregate-workers"></a>
+
+##### 16. Update or merge accumulator states
+
+**Component.** Scoped aggregate workers. After the barrier, gather each group and create DataFusion accumulators. Final modes merge serialized state columns; other modes update from expression inputs. Partial mode emits states, while other modes evaluate final values.
+
+**Techniques at this step.** [Update and merge aggregate accumulator states](#technique-partial-aggregate-states) · [Run scoped workers with a barrier and collect results](#technique-scoped-worker-execution) · [Evaluate expressions and transform Arrow columns](#technique-arrow-columnar-evaluation).
+
+**Source.** [`src/engine.rs:365`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L365) · [`src/engine.rs:378`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L378) · [`src/engine.rs:393`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L393). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-aggregate-collect"></a>
+
+##### 17. Collect aggregate batches
+
+**Component.** Engine::aggregate / record. Convert group rows to Arrow batches, join scoped worker handles, propagate errors, and record worker IDs. There is no spill-to-disk path.
+
+**Techniques at this step.** [Run scoped workers with a barrier and collect results](#technique-scoped-worker-execution) · [Enforce row caps at scan and join output](#technique-bounded-materialization).
+
+**Source.** [`src/engine.rs:409`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L409) · [`src/engine.rs:415`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L415) · [`src/engine.rs:316`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/engine.rs#L316). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-pipeline-source"></a>
+
+##### 18. Pull serial source batch
+
+**Component.** Preserved Pipeline::execute. This independent library pipeline pulls from its source and pushes operator index zero onto a local stack. The custom CLI executor does not call this pipeline.
+
+**Techniques at this step.** [Reschedule serial pipeline batches with an explicit stack](#technique-serial-pipeline-rescheduling).
+
+**Source.** [`src/parallel/pipeline.rs:48`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/parallel/pipeline.rs#L48) · [`src/parallel/pipeline.rs:56`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/parallel/pipeline.rs#L56). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-pipeline-operator"></a>
+
+##### 19. Resume serial operators
+
+**Component.** Preserved Pipeline stack. Pop work from the local stack. HaveMoreOutput requeues the current operator/input and schedules the emitted batch at the next index; Finished only schedules the emitted batch at the next index.
+
+**Techniques at this step.** [Reschedule serial pipeline batches with an explicit stack](#technique-serial-pipeline-rescheduling).
+
+**Source.** [`src/parallel/pipeline.rs:70`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/parallel/pipeline.rs#L70) · [`src/parallel/pipeline.rs:86`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/parallel/pipeline.rs#L86). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-pipeline-sink"></a>
+
+##### 20. Consume or finish
+
+**Component.** Preserved Sink. When the index passes the operators, call sink. NeedMoreInput continues stack work; Finished exits the outer source loop. A finished source also exits that loop.
+
+**Techniques at this step.** [Reschedule serial pipeline batches with an explicit stack](#technique-serial-pipeline-rescheduling).
+
+**Source.** [`src/parallel/pipeline.rs:64`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/parallel/pipeline.rs#L64) · [`src/parallel/pipeline.rs:77`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/parallel/pipeline.rs#L77). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-pipeline-finalize"></a>
+
+##### 21. Finalize serial entry
+
+**Component.** Preserved Pipeline store. After the loop, finalize the sink and insert its entry into the shared RefCell-backed store. This is serial scheduling, despite the module directory name.
+
+**Techniques at this step.** [Reschedule serial pipeline batches with an explicit stack](#technique-serial-pipeline-rescheduling).
+
+**Source.** [`src/parallel/pipeline.rs:107`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/src/parallel/pipeline.rs#L107). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-verify-cases"></a>
+
+##### 22. Run differential verification cases
+
+**Component.** scripts/verify.ps1. The separate verification driver runs library tests, requires the built CLI, and invokes custom, reference, and tuned-reference modes for empty and nonempty fixtures. It compares exact CSV output and fails on nonzero exits or mismatches.
+
+**Techniques at this step.** [Select DataFusion as an explicit comparison oracle](#technique-explicit-reference-oracle).
+
+**Source.** [`scripts/verify.ps1:6`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/scripts/verify.ps1#L6) · [`scripts/verify.ps1:24`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/scripts/verify.ps1#L24) · [`scripts/verify.ps1:33`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/scripts/verify.ps1#L33). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-verify-boundaries"></a>
+
+##### 23. Check formats and rejection paths
+
+**Component.** scripts/verify.ps1. Check Parquet and CSV aggregates, invalid worker counts, and unsupported outer joins. Remove the scratch CSV fixture while retaining logs and result evidence. This describes the driver, not a newly executed test result.
+
+**Techniques at this step.** [Select DataFusion as an explicit comparison oracle](#technique-explicit-reference-oracle).
+
+**Source.** [`scripts/verify.ps1:39`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/scripts/verify.ps1#L39) · [`scripts/verify.ps1:50`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/scripts/verify.ps1#L50) · [`scripts/verify.ps1:55`](https://github.com/STEVVVU/sql-execution-engine/blob/vectorloom/scripts/verify.ps1#L55). [Back to execution flow](#execution-flow).
+
+<details>
+<summary>Scope and subsystem coverage</summary>
+
+Active CLI and custom executor in src/main.rs and src/engine.rs, plus the preserved serial source/operator/sink pipeline in src/parallel/pipeline.rs. DataFusion planning, Arrow expression and batch primitives, CSV/Parquet readers, reference execution, ahash selection, and verify driver are documented only where directly invoked by these paths.
+
+- **CLI, inputs, planning and serialization.** Covered by the named execution steps and their source references; independent library and verification entry points remain separate. [Step 1](#flow-step-validate), [Step 2](#flow-step-load), [Step 3](#flow-step-plan), [Step 5](#flow-step-reference), [Step 6](#flow-step-serialize), [Step 7](#flow-step-fail).
+- **Custom physical-plan walker and Arrow operators.** Covered by the named execution steps and their source references; independent library and verification entry points remain separate. [Step 4](#flow-step-dispatch), [Step 8](#flow-step-scan), [Step 9](#flow-step-children), [Step 10](#flow-step-unary), [Step 11](#flow-step-sort-limit).
+- **Parallel joins and aggregates.** Covered by the named execution steps and their source references; independent library and verification entry points remain separate. [Step 12](#flow-step-join-partition), [Step 13](#flow-step-join-workers), [Step 14](#flow-step-join-collect), [Step 15](#flow-step-aggregate-partition), [Step 16](#flow-step-aggregate-workers), [Step 17](#flow-step-aggregate-collect).
+- **Preserved serial operator pipeline.** Covered by the named execution steps and their source references; independent library and verification entry points remain separate. [Step 18](#flow-step-pipeline-source), [Step 19](#flow-step-pipeline-operator), [Step 20](#flow-step-pipeline-sink), [Step 21](#flow-step-pipeline-finalize).
+- **Differential verification.** Covered by the named execution steps and their source references; independent library and verification entry points remain separate. [Step 22](#flow-step-verify-cases), [Step 23](#flow-step-verify-boundaries).
+
+Outside this flow audit:
+
+- `other preserved operators and experiments`. Only the CLI executor and directly documented serial pipeline are within the audited active scope.
+
+</details>
+
+<!-- execution-flow:end -->
+
+<details>
+<summary>Subsystem technique index</summary>
+
 ### Subsystem map
 
 Select a subsystem in the diagram to open its techniques, tradeoffs, and code references. The numbered links provide the same navigation. This map groups components; the execution diagrams show their runtime flow.
@@ -42,6 +472,8 @@ flowchart LR
 The inherited CMU capstone supplies Arrow operators, tests, and the original serial pipeline. DataFusion supplies SQL parsing, optimization, physical planning, expressions, CSV and Parquet decoding, and the explicit reference executor. The added CLI registers input tables and uses the custom owned executor by default or the explicitly requested DataFusion reference path. The preserved serial pipeline remains a separate library path. The custom executor does not silently fall back for unsupported nodes.
 
 This boundary map shows the CLI, DataFusion planning boundary, and the two explicitly selectable execution paths.
+
+</details>
 
 <details>
 <summary>Expand flow diagram 1</summary>

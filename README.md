@@ -19,6 +19,27 @@ Upstream is [cmu-db/15721-s24-ee2](https://github.com/cmu-db/15721-s24-ee2), bas
 
 Start with the primary path, then expand a detailed workflow. Select a numbered node to see its operation, implementation techniques, and source. Solid arrows show the named control, data, or lifecycle handoff; dotted arrows show error paths. Separate entry points are named in each workflow.
 
+<a id="review-walkthrough"></a>
+
+#### Walk through one concrete example
+
+Run the CLI with a supported inner join over the built-in synthetic l and r tables, then inspect its CSV result.
+
+**Trace.** [Validate CLI and SQL](#flow-step-validate) → [Materialize input tables](#flow-step-load) → [Build physical plan](#flow-step-plan) → [Walk custom plan](#flow-step-dispatch) → [Serialize CSV and diagnostics](#flow-step-serialize).
+
+**Result and boundary.** The CLI validates one query, registers Arrow tables, asks DataFusion to plan it, and sends the supported plan to the custom executor. Join details below explain serial key partitioning and parallel build/probe workers. Results become CSV; unsupported custom nodes fail rather than silently using the reference executor.
+
+<details>
+<summary>Implementation decisions to explain</summary>
+
+**Why partition by complete typed join keys and still compare full keys in each worker?** Typed composite keys keep multi-column values distinct during partitioning, while full equality checks prevent hash collisions from becoming false matches. Partitioning enables parallel work but does not rebalance skew or provide spill-to-disk behavior.
+
+[Build typed composite keys with exact equality](#technique-typed-composite-keys) · [Partition complete keys by hash](#technique-hash-partitioning) · [Build and probe partition-local hash tables](#technique-parallel-hash-join).
+
+</details>
+
+#### Primary execution flow
+
 CLI entry to CSV output. Custom execution is expanded below; explicit reference execution is a separate selected branch.
 
 ```mermaid
